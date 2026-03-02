@@ -21,7 +21,7 @@ A local MCP (Model Context Protocol) proxy that connects to remote MCP servers a
 ### 1. Install
 
 ```bash
-git clone https://github.com/user/x402-mcp-proxy.git
+git clone https://github.com/coinmarketcap-official/x402-mcp-proxy.git
 cd x402-mcp-proxy
 pnpm install
 ```
