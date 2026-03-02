@@ -1,0 +1,27 @@
+{
+  "name": "x402-mcp-proxy",
+  "version": "1.0.0",
+  "description": "MCP proxy that connects to remote MCP servers and handles x402 payments automatically",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.9.0",
+    "@scure/base": "^1.2.6",
+    "@solana/kit": "^2.1.1",
+    "@x402/axios": "^2.4.0",
+    "@x402/evm": "^2.4.0",
+    "@x402/svm": "^2.4.0",
+    "dotenv": "^16.4.7",
+    "viem": "^2.39.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "x402mcpServers": [
+    {
+      "url": "https://mcp.coinmarketcap.com/mcp",
+      "prefix": "cmc",
+      "headers": {
+        "X-CMC-MCP-API-KEY": "your_api_key_here"
+      }
+    },
+    {
+      "url": "https://pro.coinmarketcap.com/x402/mcp",
+      "prefix": "cmc_x402"
+    }
+  ]
+}
