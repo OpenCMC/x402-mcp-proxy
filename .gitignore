@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+x402-mcps.json
+*.tsbuildinfo
+.pnpm-store/
+mcp-sdk

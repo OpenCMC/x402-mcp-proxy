@@ -8,7 +8,7 @@
       }
     },
     {
-      "url": "https://pro.coinmarketcap.com/x402/mcp",
+      "url": "https://mcp.coinmarketcap.com/x402/mcp",
       "prefix": "cmc_x402"
     }
   ]

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   ListToolsRequestSchema,
@@ -294,16 +294,16 @@ async function main() {
     process.exit(1);
   }
 
-  const server = new Server(
+  const mcpServer = new McpServer(
     { name: "x402 MCP Proxy", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  mcpServer.server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: Array.from(registry.values()).map((r) => r.tool),
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  mcpServer.server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const entry = registry.get(name);
 
@@ -321,7 +321,7 @@ async function main() {
   });
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await mcpServer.connect(transport);
   console.error(
     `[x402-proxy] Ready — ${registry.size} tools from ${x402MCPs.length} remote MCP(s)`,
   );
