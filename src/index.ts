@@ -24,6 +24,37 @@ import { config } from "dotenv";
 config();
 
 // ---------------------------------------------------------------------------
+// Payment safety limits
+// ---------------------------------------------------------------------------
+interface PaymentLimits {
+  maxPerRequest: bigint;
+  maxPerSession: bigint;
+  allowedNetworks: Set<string>;
+  allowedAssets: Set<string>;
+}
+
+function loadPaymentLimits(): PaymentLimits {
+  return {
+    maxPerRequest: BigInt(process.env.X402_MAX_PAYMENT ?? "100000"),
+    maxPerSession: BigInt(process.env.X402_MAX_SPEND_PER_SESSION ?? "1000000"),
+    allowedNetworks: new Set(
+      (process.env.X402_ALLOWED_NETWORKS ?? "eip155:8453,solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp")
+        .split(",").map((s) => s.trim()).filter(Boolean),
+    ),
+    allowedAssets: new Set(
+      (
+        process.env.X402_ALLOWED_ASSETS ??
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      )
+        .split(",").map((s) => s.trim()).filter(Boolean),
+    ),
+  };
+}
+
+const paymentLimits = loadPaymentLimits();
+let sessionSpend = BigInt(0);
+
+// ---------------------------------------------------------------------------
 // Remote MCP configuration
 // ---------------------------------------------------------------------------
 interface RemoteMcp {
@@ -109,7 +140,27 @@ function extractList(parsed: unknown): RemoteMcp[] {
   return [];
 }
 
+function warnInsecureUrls(mcps: RemoteMcp[]): void {
+  for (const mcp of mcps) {
+    try {
+      const parsed = new URL(mcp.url);
+      const isLocal = ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+      if (parsed.protocol !== "https:" && !isLocal) {
+        console.error(
+          `[x402-proxy] WARNING: "${mcp.prefix}" uses insecure protocol ` +
+            `(${parsed.protocol}). Payment signatures may be exposed in transit.`,
+        );
+      }
+    } catch {
+      console.error(
+        `[x402-proxy] WARNING: "${mcp.prefix}" has an invalid URL: ${mcp.url}`,
+      );
+    }
+  }
+}
+
 const x402MCPs: RemoteMcp[] = loadRemoteMcps();
+warnInsecureUrls(x402MCPs);
 
 if (x402MCPs.length === 0) {
   console.error(
@@ -154,7 +205,88 @@ async function createX402Client(): Promise<x402HTTPClient | null> {
 }
 
 // ---------------------------------------------------------------------------
-// x402-aware fetch: intercepts HTTP 402, signs payment, retries
+// Payment validation & audit
+// ---------------------------------------------------------------------------
+interface PaymentAccept {
+  maxAmountRequired?: string;
+  network?: string;
+  asset?: string;
+  payTo?: string;
+}
+
+function assetAllowed(asset: string): boolean {
+  if (paymentLimits.allowedAssets.size === 0) return true;
+  if (paymentLimits.allowedAssets.has(asset)) return true;
+  if (asset.startsWith("0x")) {
+    const lower = asset.toLowerCase();
+    for (const a of paymentLimits.allowedAssets) {
+      if (a.startsWith("0x") && a.toLowerCase() === lower) return true;
+    }
+  }
+  return false;
+}
+
+function validatePaymentRequired(
+  accepts: PaymentAccept[] | undefined,
+  requestUrl: string,
+): bigint {
+  if (!Array.isArray(accepts) || accepts.length === 0) {
+    throw new Error(`Malformed 402 for ${requestUrl}: no payment schemes`);
+  }
+
+  let maxCost = BigInt(0);
+  for (const s of accepts) {
+    const amount = BigInt(s.maxAmountRequired ?? "0");
+    const network = s.network ?? "";
+    const asset = s.asset ?? "";
+
+    if (amount > paymentLimits.maxPerRequest) {
+      throw new Error(
+        `Amount ${amount} exceeds per-request limit ${paymentLimits.maxPerRequest} ` +
+          `(network: ${network}, payTo: ${s.payTo ?? "?"})`,
+      );
+    }
+
+    if (
+      paymentLimits.allowedNetworks.size > 0 &&
+      !paymentLimits.allowedNetworks.has(network)
+    ) {
+      throw new Error(`Network "${network}" is not in the allowed list`);
+    }
+
+    if (asset && !assetAllowed(asset)) {
+      throw new Error(`Asset "${asset}" is not in the allowed list`);
+    }
+
+    if (amount > maxCost) maxCost = amount;
+  }
+
+  if (sessionSpend + maxCost > paymentLimits.maxPerSession) {
+    throw new Error(
+      `Session spending limit reached ` +
+        `(spent: ${sessionSpend}, request: ${maxCost}, limit: ${paymentLimits.maxPerSession})`,
+    );
+  }
+
+  return maxCost;
+}
+
+function logPaymentAudit(
+  accepts: PaymentAccept[] | undefined,
+  requestUrl: string,
+  cost: bigint,
+): void {
+  const s = accepts?.[0];
+  console.error(
+    `[x402-proxy] Payment: ${cost} | ` +
+      `network: ${s?.network ?? "?"} | asset: ${s?.asset ?? "?"} | ` +
+      `payTo: ${s?.payTo ?? "?"} | url: ${requestUrl} | ` +
+      `session total: ${sessionSpend}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// x402-aware fetch: intercepts HTTP 402, validates, signs payment, retries
 // ---------------------------------------------------------------------------
 function createX402Fetch(
   httpClient: x402HTTPClient,
@@ -165,22 +297,46 @@ function createX402Fetch(
 
     if (response.status !== 402) return response;
 
-    console.error("[x402-proxy] 402 received, handling payment…");
+    const requestUrl =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+
+    console.error(`[x402-proxy] 402 received for ${requestUrl}`);
 
     const paymentRequired = httpClient.getPaymentRequiredResponse(
       (name) => response.headers.get(name) ?? null,
     );
 
-    const hookHeaders = await httpClient.handlePaymentRequired(paymentRequired);
+    const accepts = (paymentRequired as { accepts?: PaymentAccept[] }).accepts;
+
+    let estimatedCost: bigint;
+    try {
+      estimatedCost = validatePaymentRequired(accepts, requestUrl);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[x402-proxy] Payment rejected: ${msg}`);
+      return response;
+    }
+
+    const hookHeaders =
+      await httpClient.handlePaymentRequired(paymentRequired);
     if (hookHeaders) {
+      sessionSpend += estimatedCost;
+      logPaymentAudit(accepts, requestUrl, estimatedCost);
       const merged = mergeHeaders(init?.headers, hookHeaders);
       return baseFetch(input, { ...init, headers: merged });
     }
 
-    const payload = await httpClient.createPaymentPayload(paymentRequired);
-    const paymentHeaders = httpClient.encodePaymentSignatureHeader(payload);
+    const payload =
+      await httpClient.createPaymentPayload(paymentRequired);
+    const paymentHeaders =
+      httpClient.encodePaymentSignatureHeader(payload);
 
-    console.error("[x402-proxy] Payment signed, retrying request…");
+    sessionSpend += estimatedCost;
+    logPaymentAudit(accepts, requestUrl, estimatedCost);
 
     const merged = mergeHeaders(init?.headers, paymentHeaders);
     return baseFetch(input, { ...init, headers: merged });
@@ -328,6 +484,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error);
+  const msg = error instanceof Error ? error.message : String(error);
+  console.error(`[x402-proxy] Fatal: ${msg}`);
   process.exit(1);
 });

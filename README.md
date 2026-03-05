@@ -160,6 +160,19 @@ You can also point to a config file for more advanced options (custom headers, e
 
 At least one key is required for x402 payment handling.
 
+### Payment Safety Limits
+
+The proxy validates every 402 payment request before signing. All limits are configurable via environment variables:
+
+| Env Variable | Default | Description |
+|-------------|---------|-------------|
+| `X402_MAX_PAYMENT` | `100000` (0.10 USDC) | Maximum amount per single request (in asset smallest unit) |
+| `X402_MAX_SPEND_PER_SESSION` | `1000000` (1.00 USDC) | Maximum cumulative spend per proxy session |
+| `X402_ALLOWED_NETWORKS` | `eip155:8453,solana:5eykt…` | Comma-separated allowlist of CAIP-2 network IDs |
+| `X402_ALLOWED_ASSETS` | Base USDC, Solana USDC | Comma-separated allowlist of asset contract addresses |
+
+If a 402 response requests an amount, network, or asset outside these limits, the proxy **rejects the payment and returns the raw 402 to the client** without signing anything. Session spend resets when the proxy process restarts.
+
 ## What is x402?
 
 [x402](https://docs.cdp.coinbase.com/x402/welcome) is an open protocol by Coinbase that enables instant, pay-per-request API access using stablecoin payments over HTTP. When an API returns HTTP 402, the client signs a USDC transfer authorization, and the server's facilitator executes the on-chain payment only after successfully delivering the response.
@@ -180,6 +193,35 @@ x402-mcp-proxy/
 ├── tsconfig.json
 └── LICENSE                # MIT
 ```
+
+## Security Considerations
+
+### Trust Model
+
+This proxy is designed to run **locally on your own machine** as a stdio-based MCP server. The AI client (Claude, Cursor, etc.) communicates with it over stdin/stdout — there is no network listener. Authentication between the client and the proxy is therefore handled by OS-level process isolation.
+
+If you deploy this proxy in a **shared or multi-user environment** (e.g., a server accessed by multiple users), you should add an authentication layer in front of it. The default stdio transport is not designed for that use case.
+
+### Private Key Storage
+
+Private keys are loaded from environment variables (typically a `.env` file). For personal / development use this is acceptable, but for production or high-value wallets consider:
+
+- **OS keychain** integration (macOS Keychain, Linux secret-service)
+- **Hardware wallets** or **cloud KMS** (AWS KMS, GCP Cloud KMS)
+- **Encrypted env files** with a passphrase
+
+Never commit `.env` files containing real private keys to version control.
+
+### Built-in Protections
+
+The proxy ships with several safety checks enabled by default:
+
+- **Per-request amount cap** — rejects 402 responses that request more than the configured limit
+- **Session spending cap** — stops signing once cumulative spend reaches the threshold
+- **Network & asset allowlists** — only pays on explicitly permitted chains and tokens
+- **HTTPS enforcement** — warns at startup if any remote MCP URL uses an insecure protocol (non-localhost HTTP)
+- **Sanitised error output** — internal error details are not leaked to clients
+- **Structured payment audit log** — every signed payment is logged to stderr with amount, network, asset, recipient, and target URL
 
 ## License
 
