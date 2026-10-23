@@ -173,24 +173,6 @@ The proxy validates every 402 payment request before signing. All limits are con
 
 If a 402 response requests an amount, network, or asset outside these limits, the proxy **rejects the payment and returns the raw 402 to the client** without signing anything. Session spend resets when the proxy process restarts.
 
-### Optional AgentResolver pre-sign Guard
-
-For an external payment-contract check before the merchant payment is signed, enable AgentResolver Guard:
-
-```env
-AGENTRESOLVER_GUARD=1
-# Optional override:
-# AGENTRESOLVER_GUARD_URL=https://agentresolver.vercel.app/api/payment-guard
-```
-
-The integration runs **after the proxy's local amount/network/asset/session checks and before payment payload creation**. It sends no merchant private key or merchant payment signature to AgentResolver. AgentResolver validates the exact 402 challenge already observed by the proxy, checks the selected network, asset, recipient, amount, scheme, and resource binding, and independently verifies the target's HTTPS/TLS reachability with a safe HEAD probe.
-
-Each successful Guard check costs **$0.001 USDC**. The Guard fee uses a separate payment-enabled fetch path that is deliberately not Guard-wrapped, preventing recursive Guard calls. The fee counts toward the same session spend budget, and the merchant payment is re-checked against the updated session total before signing.
-
-Guard is opt-in and fail-closed: if the check fails, is blocked, or its returned payment evidence does not match the payment requirement the proxy intends to use, the proxy returns the original 402 without signing the merchant payment.
-
-For POST requests, the merchant tool request is **not replayed**. The already-observed 402 challenge is validated directly and the target is checked with a side-effect-safe HEAD/TLS probe.
-
 ## What is x402?
 
 [x402](https://docs.cdp.coinbase.com/x402/welcome) is an open protocol by Coinbase that enables instant, pay-per-request API access using stablecoin payments over HTTP. When an API returns HTTP 402, the client signs a USDC transfer authorization, and the server's facilitator executes the on-chain payment only after successfully delivering the response.

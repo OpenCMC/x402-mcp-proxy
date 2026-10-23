@@ -20,12 +20,6 @@ import { base } from "viem/chains";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { base58 } from "@scure/base";
 import { config } from "dotenv";
-import {
-  agentResolverGuardEnabled,
-  assertAgentResolverGuard,
-  bindGuardedRequirement,
-  selectGuardRequirement,
-} from "./agentresolver.js";
 
 config();
 
@@ -215,8 +209,6 @@ async function createX402Client(): Promise<x402HTTPClient | null> {
 // ---------------------------------------------------------------------------
 interface PaymentAccept {
   maxAmountRequired?: string;
-  amount?: string;
-  scheme?: string;
   network?: string;
   asset?: string;
   payTo?: string;
@@ -244,7 +236,7 @@ function validatePaymentRequired(
 
   let maxCost = BigInt(0);
   for (const s of accepts) {
-    const amount = BigInt(s.amount ?? s.maxAmountRequired ?? "0");
+    const amount = BigInt(s.maxAmountRequired ?? "0");
     const network = s.network ?? "";
     const asset = s.asset ?? "";
 
@@ -299,7 +291,6 @@ function logPaymentAudit(
 function createX402Fetch(
   httpClient: x402HTTPClient,
   baseFetch: typeof globalThis.fetch = globalThis.fetch,
-  guardEnabled = true,
 ): typeof globalThis.fetch {
   return async (input, init) => {
     const response = await baseFetch(input, init);
@@ -319,11 +310,9 @@ function createX402Fetch(
       (name) => response.headers.get(name) ?? null,
     );
 
-    const accepts = paymentRequired.accepts;
+    const accepts = (paymentRequired as { accepts?: PaymentAccept[] }).accepts;
 
     let estimatedCost: bigint;
-    let paymentRequiredForSigning = paymentRequired;
-    let acceptsForSigning = accepts;
     try {
       estimatedCost = validatePaymentRequired(accepts, requestUrl);
     } catch (err) {
@@ -336,67 +325,18 @@ function createX402Fetch(
       await httpClient.handlePaymentRequired(paymentRequired);
     if (hookHeaders) {
       sessionSpend += estimatedCost;
-      logPaymentAudit(acceptsForSigning, requestUrl, estimatedCost);
+      logPaymentAudit(accepts, requestUrl, estimatedCost);
       const merged = mergeHeaders(init?.headers, hookHeaders);
       return baseFetch(input, { ...init, headers: merged });
     }
 
-    if (guardEnabled && agentResolverGuardEnabled()) {
-      const selectedRequirement = selectGuardRequirement(accepts, {
-        evm: Boolean(process.env.EVM_PRIVATE_KEY),
-        svm: Boolean(process.env.SVM_PRIVATE_KEY),
-      });
-
-      if (!selectedRequirement) {
-        console.error(
-          "[x402-proxy] AgentResolver Guard failed closed: no supported exact payment requirement for " +
-            requestUrl,
-        );
-        return response;
-      }
-
-      const requestMethod = (
-        init?.method ??
-        (input instanceof Request ? input.method : "GET")
-      ).toUpperCase();
-
-      try {
-        // Separate hook-free path for AgentResolver's own $0.001 x402 fee.
-        const guardFetch = createX402Fetch(httpClient, baseFetch, false);
-        await assertAgentResolverGuard({
-          guardFetch,
-          requestUrl,
-          method: requestMethod,
-          paymentRequired,
-          requirement: selectedRequirement,
-        });
-
-        // The Guard fee counts toward session spend. Re-check the merchant
-        // payment against the updated total before any target signature exists.
-        paymentRequiredForSigning = bindGuardedRequirement(
-          paymentRequired,
-          selectedRequirement,
-        );
-        acceptsForSigning = [selectedRequirement];
-        estimatedCost = validatePaymentRequired(acceptsForSigning, requestUrl);
-        console.error(
-          "[x402-proxy] AgentResolver Guard eligible: " + requestUrl,
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("[x402-proxy] AgentResolver Guard blocked: " + msg);
-        return response;
-      }
-    }
-
-
     const payload =
-      await httpClient.createPaymentPayload(paymentRequiredForSigning);
+      await httpClient.createPaymentPayload(paymentRequired);
     const paymentHeaders =
       httpClient.encodePaymentSignatureHeader(payload);
 
     sessionSpend += estimatedCost;
-    logPaymentAudit(acceptsForSigning, requestUrl, estimatedCost);
+    logPaymentAudit(accepts, requestUrl, estimatedCost);
 
     const merged = mergeHeaders(init?.headers, paymentHeaders);
     return baseFetch(input, { ...init, headers: merged });
