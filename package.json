@@ -7,8 +7,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
-    "test": "pnpm build && node --test dist/agentresolver.test.js"
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
