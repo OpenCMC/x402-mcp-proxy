@@ -20,36 +20,10 @@ import { base } from "viem/chains";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { base58 } from "@scure/base";
 import { config } from "dotenv";
+import { registerCasperScheme } from "./casper.js";
+import { loadPaymentLimits } from "./limits.js";
 
 config();
-
-// ---------------------------------------------------------------------------
-// Payment safety limits
-// ---------------------------------------------------------------------------
-interface PaymentLimits {
-  maxPerRequest: bigint;
-  maxPerSession: bigint;
-  allowedNetworks: Set<string>;
-  allowedAssets: Set<string>;
-}
-
-function loadPaymentLimits(): PaymentLimits {
-  return {
-    maxPerRequest: BigInt(process.env.X402_MAX_PAYMENT ?? "100000"),
-    maxPerSession: BigInt(process.env.X402_MAX_SPEND_PER_SESSION ?? "1000000"),
-    allowedNetworks: new Set(
-      (process.env.X402_ALLOWED_NETWORKS ?? "eip155:8453,solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp")
-        .split(",").map((s) => s.trim()).filter(Boolean),
-    ),
-    allowedAssets: new Set(
-      (
-        process.env.X402_ALLOWED_ASSETS ??
-        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-      )
-        .split(",").map((s) => s.trim()).filter(Boolean),
-    ),
-  };
-}
 
 const paymentLimits = loadPaymentLimits();
 let sessionSpend = BigInt(0);
@@ -177,8 +151,9 @@ if (x402MCPs.length === 0) {
 async function createX402Client(): Promise<x402HTTPClient | null> {
   const evmPrivateKey = process.env.EVM_PRIVATE_KEY as `0x${string}` | undefined;
   const svmPrivateKey = process.env.SVM_PRIVATE_KEY as string | undefined;
+  const casperPrivateKey = process.env.CASPER_PRIVATE_KEY as string | undefined;
 
-  if (!evmPrivateKey && !svmPrivateKey) {
+  if (!evmPrivateKey && !svmPrivateKey && !casperPrivateKey) {
     console.error("No private key found, exiting.");
     return null;
   }
@@ -200,6 +175,8 @@ async function createX402Client(): Promise<x402HTTPClient | null> {
     );
     client.register("solana:*", new ExactSvmScheme(svmSigner));
   }
+
+  registerCasperScheme(client, casperPrivateKey);
 
   return new x402HTTPClient(client);
 }
