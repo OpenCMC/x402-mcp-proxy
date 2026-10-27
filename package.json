@@ -7,15 +7,18 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
+    "@make-software/casper-x402": "^1.0.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@scure/base": "^2.0.0",
     "@solana/kit": "^6.1.0",
     "@x402/axios": "^2.5.0",
     "@x402/evm": "^2.5.0",
     "@x402/svm": "^2.5.0",
+    "casper-js-sdk": "^5.0.12",
     "dotenv": "^17.3.1",
     "viem": "^2.39.0"
   },
