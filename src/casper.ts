@@ -1,7 +1,10 @@
 import type { x402Client } from "@x402/axios";
 import { ExactCasperScheme } from "@make-software/casper-x402/exact/client";
 import { toClientCasperSigner } from "@make-software/casper-x402";
-import { KeyAlgorithm, PrivateKey } from "casper-js-sdk";
+import casperSdk, { type PrivateKey } from "casper-js-sdk";
+
+// casper-js-sdk is CommonJS; named runtime imports are not available under ESM.
+const { KeyAlgorithm, PrivateKey: CasperPrivateKey } = casperSdk;
 
 // ---------------------------------------------------------------------------
 // Casper payment rail (opt-in via CASPER_PRIVATE_KEY)
@@ -38,7 +41,7 @@ export function parseCasperPrivateKey(raw: string): PrivateKey {
   }
 
   const algorithm = match[1] === "01" ? KeyAlgorithm.ED25519 : KeyAlgorithm.SECP256K1;
-  return PrivateKey.fromHex(match[2], algorithm);
+  return CasperPrivateKey.fromHex(match[2], algorithm);
 }
 
 /**
