@@ -5,7 +5,8 @@
       "prefix": "cmc",
       "headers": {
         "X-CMC-MCP-API-KEY": "your_api_key_here"
-      }
+      },
+      "x402": false
     },
     {
       "url": "https://mcp.coinmarketcap.com/x402/mcp",

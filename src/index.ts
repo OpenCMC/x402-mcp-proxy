@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -20,39 +21,33 @@ import { base } from "viem/chains";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { base58 } from "@scure/base";
 import { config } from "dotenv";
+import {
+  createX402Fetch,
+  errMsg,
+  installPaymentGuards,
+  loadPaymentLimits,
+  type PaymentLimits,
+  type SpendTracker,
+} from "./payment.js";
 
-config();
+// Config is read only from the proxy's own install dir (parent of src/ or dist/),
+// never from the cwd the MCP host happens to launch us in.
+const PROJECT_ROOT = fileURLToPath(new URL("..", import.meta.url));
+// quiet: dotenv otherwise logs to stdout, which is the MCP stdio channel
+config({ path: resolve(PROJECT_ROOT, ".env"), quiet: true });
 
-// ---------------------------------------------------------------------------
-// Payment safety limits
-// ---------------------------------------------------------------------------
-interface PaymentLimits {
-  maxPerRequest: bigint;
-  maxPerSession: bigint;
-  allowedNetworks: Set<string>;
-  allowedAssets: Set<string>;
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+  console.error("[x402-proxy] NODE_TLS_REJECT_UNAUTHORIZED=0 is not allowed, exiting.");
+  process.exit(1);
 }
 
-function loadPaymentLimits(): PaymentLimits {
-  return {
-    maxPerRequest: BigInt(process.env.X402_MAX_PAYMENT ?? "100000"),
-    maxPerSession: BigInt(process.env.X402_MAX_SPEND_PER_SESSION ?? "1000000"),
-    allowedNetworks: new Set(
-      (process.env.X402_ALLOWED_NETWORKS ?? "eip155:8453,solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp")
-        .split(",").map((s) => s.trim()).filter(Boolean),
-    ),
-    allowedAssets: new Set(
-      (
-        process.env.X402_ALLOWED_ASSETS ??
-        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-      )
-        .split(",").map((s) => s.trim()).filter(Boolean),
-    ),
-  };
+let paymentLimits: PaymentLimits;
+try {
+  paymentLimits = loadPaymentLimits();
+} catch (err) {
+  console.error(`[x402-proxy] Invalid payment limits: ${errMsg(err)}`);
+  process.exit(1);
 }
-
-const paymentLimits = loadPaymentLimits();
-let sessionSpend = BigInt(0);
 
 // ---------------------------------------------------------------------------
 // Remote MCP configuration
@@ -61,6 +56,8 @@ interface RemoteMcp {
   url: string;
   prefix: string;
   headers?: Record<string, string>;
+  /** Set to false for remotes that never charge (e.g. API-key auth) so no payment is ever signed for them */
+  x402?: boolean;
 }
 
 /**
@@ -73,7 +70,7 @@ interface RemoteMcp {
  *   or ["example","https://mcp.example.com/mcp","other","https://other.com/mcp"]
  *
  * Config file format ({ "x402mcpServers": [...] } or bare array):
- *   { "x402mcpServers": [{ "url": "…", "prefix": "…", "headers": {} }] }
+ *   { "x402mcpServers": [{ "url": "…", "prefix": "…", "headers": {}, "x402": true }] }
  */
 function loadRemoteMcps(): RemoteMcp[] {
   const envMcps = process.env.X402_REMOTE_MCPS;
@@ -85,7 +82,8 @@ function loadRemoteMcps(): RemoteMcp[] {
     }
   }
 
-  const configPath = resolve(process.env.X402_CONFIG ?? "x402-mcps.json");
+  // Relative paths resolve against the install dir; absolute paths are used as-is
+  const configPath = resolve(PROJECT_ROOT, process.env.X402_CONFIG ?? "x402-mcps.json");
   try {
     const raw = readFileSync(configPath, "utf-8");
     const parsed = JSON.parse(raw);
@@ -174,7 +172,12 @@ if (x402MCPs.length === 0) {
 // ---------------------------------------------------------------------------
 // x402 payment client
 // ---------------------------------------------------------------------------
-async function createX402Client(): Promise<x402HTTPClient | null> {
+interface PaymentClient {
+  httpClient: x402HTTPClient;
+  tracker: SpendTracker;
+}
+
+async function createX402Client(): Promise<PaymentClient | null> {
   const evmPrivateKey = process.env.EVM_PRIVATE_KEY as `0x${string}` | undefined;
   const svmPrivateKey = process.env.SVM_PRIVATE_KEY as string | undefined;
 
@@ -201,164 +204,8 @@ async function createX402Client(): Promise<x402HTTPClient | null> {
     client.register("solana:*", new ExactSvmScheme(svmSigner));
   }
 
-  return new x402HTTPClient(client);
-}
-
-// ---------------------------------------------------------------------------
-// Payment validation & audit
-// ---------------------------------------------------------------------------
-interface PaymentAccept {
-  maxAmountRequired?: string;
-  network?: string;
-  asset?: string;
-  payTo?: string;
-}
-
-function assetAllowed(asset: string): boolean {
-  if (paymentLimits.allowedAssets.size === 0) return true;
-  if (paymentLimits.allowedAssets.has(asset)) return true;
-  if (asset.startsWith("0x")) {
-    const lower = asset.toLowerCase();
-    for (const a of paymentLimits.allowedAssets) {
-      if (a.startsWith("0x") && a.toLowerCase() === lower) return true;
-    }
-  }
-  return false;
-}
-
-function validatePaymentRequired(
-  accepts: PaymentAccept[] | undefined,
-  requestUrl: string,
-): bigint {
-  if (!Array.isArray(accepts) || accepts.length === 0) {
-    throw new Error(`Malformed 402 for ${requestUrl}: no payment schemes`);
-  }
-
-  let maxCost = BigInt(0);
-  for (const s of accepts) {
-    const amount = BigInt(s.maxAmountRequired ?? "0");
-    const network = s.network ?? "";
-    const asset = s.asset ?? "";
-
-    if (amount > paymentLimits.maxPerRequest) {
-      throw new Error(
-        `Amount ${amount} exceeds per-request limit ${paymentLimits.maxPerRequest} ` +
-          `(network: ${network}, payTo: ${s.payTo ?? "?"})`,
-      );
-    }
-
-    if (
-      paymentLimits.allowedNetworks.size > 0 &&
-      !paymentLimits.allowedNetworks.has(network)
-    ) {
-      throw new Error(`Network "${network}" is not in the allowed list`);
-    }
-
-    if (asset && !assetAllowed(asset)) {
-      throw new Error(`Asset "${asset}" is not in the allowed list`);
-    }
-
-    if (amount > maxCost) maxCost = amount;
-  }
-
-  if (sessionSpend + maxCost > paymentLimits.maxPerSession) {
-    throw new Error(
-      `Session spending limit reached ` +
-        `(spent: ${sessionSpend}, request: ${maxCost}, limit: ${paymentLimits.maxPerSession})`,
-    );
-  }
-
-  return maxCost;
-}
-
-function logPaymentAudit(
-  accepts: PaymentAccept[] | undefined,
-  requestUrl: string,
-  cost: bigint,
-): void {
-  const s = accepts?.[0];
-  console.error(
-    `[x402-proxy] Payment: ${cost} | ` +
-      `network: ${s?.network ?? "?"} | asset: ${s?.asset ?? "?"} | ` +
-      `payTo: ${s?.payTo ?? "?"} | url: ${requestUrl} | ` +
-      `session total: ${sessionSpend}`,
-  );
-}
-
-// ---------------------------------------------------------------------------
-// x402-aware fetch: intercepts HTTP 402, validates, signs payment, retries
-// ---------------------------------------------------------------------------
-function createX402Fetch(
-  httpClient: x402HTTPClient,
-  baseFetch: typeof globalThis.fetch = globalThis.fetch,
-): typeof globalThis.fetch {
-  return async (input, init) => {
-    const response = await baseFetch(input, init);
-
-    if (response.status !== 402) return response;
-
-    const requestUrl =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.href
-          : input.url;
-
-    console.error(`[x402-proxy] 402 received for ${requestUrl}`);
-
-    const paymentRequired = httpClient.getPaymentRequiredResponse(
-      (name) => response.headers.get(name) ?? null,
-    );
-
-    const accepts = (paymentRequired as { accepts?: PaymentAccept[] }).accepts;
-
-    let estimatedCost: bigint;
-    try {
-      estimatedCost = validatePaymentRequired(accepts, requestUrl);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[x402-proxy] Payment rejected: ${msg}`);
-      return response;
-    }
-
-    const hookHeaders =
-      await httpClient.handlePaymentRequired(paymentRequired);
-    if (hookHeaders) {
-      sessionSpend += estimatedCost;
-      logPaymentAudit(accepts, requestUrl, estimatedCost);
-      const merged = mergeHeaders(init?.headers, hookHeaders);
-      return baseFetch(input, { ...init, headers: merged });
-    }
-
-    const payload =
-      await httpClient.createPaymentPayload(paymentRequired);
-    const paymentHeaders =
-      httpClient.encodePaymentSignatureHeader(payload);
-
-    sessionSpend += estimatedCost;
-    logPaymentAudit(accepts, requestUrl, estimatedCost);
-
-    const merged = mergeHeaders(init?.headers, paymentHeaders);
-    return baseFetch(input, { ...init, headers: merged });
-  };
-}
-
-function mergeHeaders(
-  existing: HeadersInit | undefined,
-  extra: Record<string, string>,
-): Record<string, string> {
-  const result: Record<string, string> = {};
-
-  if (existing instanceof Headers) {
-    existing.forEach((v, k) => { result[k] = v; });
-  } else if (Array.isArray(existing)) {
-    for (const [k, v] of existing) result[k] = v;
-  } else if (existing) {
-    Object.assign(result, existing);
-  }
-
-  Object.assign(result, extra);
-  return result;
+  const tracker = installPaymentGuards(client, paymentLimits);
+  return { httpClient: new x402HTTPClient(client), tracker };
 }
 
 // ---------------------------------------------------------------------------
@@ -366,29 +213,28 @@ function mergeHeaders(
 // ---------------------------------------------------------------------------
 async function connectRemoteMcp(
   mcp: RemoteMcp,
-  x402Fetch: typeof globalThis.fetch | null,
+  payment: PaymentClient | null,
 ): Promise<Client> {
   const url = new URL(mcp.url);
   const requestInit: RequestInit = { headers: mcp.headers ?? {} };
-  const fetchFn = x402Fetch ?? undefined;
+  // One payment fetch per remote, bound to that remote's origin
+  const fetchFn =
+    payment && mcp.x402 !== false
+      ? createX402Fetch(payment.httpClient, url.origin, payment.tracker)
+      : undefined;
 
+  const streamable = new Client({ name: "x402-proxy", version: "1.0.0" });
   try {
-    const client = new Client({ name: "x402-proxy", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(url, {
-      requestInit,
-      fetch: fetchFn,
-    });
-    await client.connect(transport);
-    return client;
+    await streamable.connect(new StreamableHTTPClientTransport(url, { requestInit, fetch: fetchFn }));
+    return streamable;
   } catch {
-    const client = new Client({ name: "x402-proxy", version: "1.0.0" });
-    const transport = new SSEClientTransport(url, {
-      requestInit,
-      eventSourceInit: { fetch: fetchFn as never },
-    });
-    await client.connect(transport);
-    return client;
+    // Close the failed client first so its standalone GET stream stops reconnecting
+    await streamable.close().catch(() => {});
   }
+
+  const client = new Client({ name: "x402-proxy", version: "1.0.0" });
+  await client.connect(new SSEClientTransport(url, { requestInit, fetch: fetchFn }));
+  return client;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,13 +247,13 @@ interface ProxiedTool {
 }
 
 async function discoverTools(
-  x402Fetch: typeof globalThis.fetch | null,
+  payment: PaymentClient | null,
 ): Promise<Map<string, ProxiedTool>> {
   const registry = new Map<string, ProxiedTool>();
 
   for (const mcp of x402MCPs) {
     try {
-      const client = await connectRemoteMcp(mcp, x402Fetch);
+      const client = await connectRemoteMcp(mcp, payment);
       const { tools } = await client.listTools();
 
       for (const tool of tools) {
@@ -429,8 +275,7 @@ async function discoverTools(
         `[x402-proxy] ✓ ${mcp.prefix}: ${tools.length} tools from ${mcp.url}`,
       );
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[x402-proxy] ✗ ${mcp.prefix}: ${msg}`);
+      console.error(`[x402-proxy] ✗ ${mcp.prefix}: ${errMsg(err)}`);
     }
   }
 
@@ -441,9 +286,8 @@ async function discoverTools(
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
-  const httpClient = await createX402Client();
-  const x402Fetch = httpClient ? createX402Fetch(httpClient) : null;
-  const registry = await discoverTools(x402Fetch);
+  const payment = await createX402Client();
+  const registry = await discoverTools(payment);
 
   if (registry.size === 0) {
     console.error("[x402-proxy] No tools discovered, exiting.");
@@ -484,7 +328,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  const msg = error instanceof Error ? error.message : String(error);
-  console.error(`[x402-proxy] Fatal: ${msg}`);
+  console.error(`[x402-proxy] Fatal: ${errMsg(error)}`);
   process.exit(1);
 });
