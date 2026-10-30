@@ -14,7 +14,7 @@ A local MCP (Model Context Protocol) proxy that connects to remote MCP servers a
 
 1. The proxy connects to one or more remote MCP servers (via Streamable HTTP or SSE).
 2. It discovers their tools and re-exposes them to the AI client over stdio, prefixed by server name (e.g. `cmc_get_quotes`).
-3. When a tool call returns HTTP 402, the proxy intercepts it, signs an EIP-3009 `transferWithAuthorization` (USDC on Base), and retries automatically.
+3. When a `tools/call` request returns HTTP 402, the proxy validates the payment request against your limits, signs an EIP-3009 `transferWithAuthorization` (USDC on Base), and retries automatically. Any other request (initialize, `tools/list`, SSE streams, …) that returns 402 is passed through unpaid.
 
 ## Quick Start
 
@@ -23,12 +23,13 @@ A local MCP (Model Context Protocol) proxy that connects to remote MCP servers a
 ```bash
 git clone https://github.com/coinmarketcap-official/x402-mcp-proxy.git
 cd x402-mcp-proxy
-pnpm install
+pnpm install --frozen-lockfile
+pnpm build
 ```
 
 ### 2. Configure Remote MCPs
 
-Create `x402-mcps.json` in the project root (see `x402-mcps.example.json`):
+Create `x402-mcps.json` in the project root (see `x402-mcps.example.json`). The proxy always reads `x402-mcps.json` and `.env` from its own install directory, never from the directory the AI client launches it in:
 
 ```json
 {
@@ -73,9 +74,12 @@ The EVM wallet needs USDC on Base for x402 payments. Solana (SVM) is also suppor
 ```bash
 pnpm dev    # development (tsx)
 pnpm build && pnpm start  # production
+pnpm test   # payment guard tests
 ```
 
 ### 5. Connect from an AI Client
+
+Run the built output with `node` and an absolute path. Avoid `npx tsx …`: `npx` resolves `tsx` starting from the client's working directory, so a `node_modules/.bin/tsx` in an opened workspace would run instead — with your private key in its environment.
 
 **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -83,11 +87,11 @@ pnpm build && pnpm start  # production
 {
   "mcpServers": {
     "x402": {
-      "command": "npx",
-      "args": ["tsx", "/path/to/x402-mcp-proxy/src/index.ts"],
+      "command": "node",
+      "args": ["/path/to/x402-mcp-proxy/dist/index.js"],
       "env": {
         "EVM_PRIVATE_KEY": "0x...",
-        "X402_REMOTE_MCPS": ["cmc", "https://pro.coinmarketcap.com/x402/mcp"]
+        "X402_REMOTE_MCPS": "cmc,https://pro.coinmarketcap.com/x402/mcp"
       }
     }
   }
@@ -100,11 +104,11 @@ pnpm build && pnpm start  # production
 {
   "mcpServers": {
     "x402": {
-      "command": "npx",
-      "args": ["tsx", "/path/to/x402-mcp-proxy/src/index.ts"],
+      "command": "node",
+      "args": ["/path/to/x402-mcp-proxy/dist/index.js"],
       "env": {
         "EVM_PRIVATE_KEY": "0x...",
-        "X402_REMOTE_MCPS": ["cmc", "https://pro.coinmarketcap.com/x402/mcp"]
+        "X402_REMOTE_MCPS": "cmc,https://pro.coinmarketcap.com/x402/mcp"
       }
     }
   }
@@ -124,7 +128,7 @@ You can also point to a config file for more advanced options (custom headers, e
 | Source | Description |
 |--------|------------|
 | `X402_REMOTE_MCPS` env | Flat pair list: `["prefix","url",…]` or `"prefix,url,…"` (takes priority) |
-| `X402_CONFIG` env | Custom path to a JSON config file |
+| `X402_CONFIG` env | Custom path to a JSON config file (relative paths resolve against the project root) |
 | `x402-mcps.json` | Default config file in project root |
 
 **Env var format** — prefix/url pairs, no headers support:
@@ -133,7 +137,7 @@ You can also point to a config file for more advanced options (custom headers, e
 ["cmc", "https://pro.coinmarketcap.com/x402/mcp"]
 ```
 
-**Config file format** — full control with headers:
+**Config file format** — full control with headers. Set `"x402": false` on remotes that never charge (e.g. API-key auth) so the proxy never signs a payment for them:
 
 ```json
 {
@@ -145,7 +149,8 @@ You can also point to a config file for more advanced options (custom headers, e
     {
       "prefix": "other",
       "url": "https://other.example.com/mcp",
-      "headers": { "Authorization": "Bearer xxx" }
+      "headers": { "Authorization": "Bearer xxx" },
+      "x402": false
     }
   ]
 }
@@ -171,7 +176,7 @@ The proxy validates every 402 payment request before signing. All limits are con
 | `X402_ALLOWED_NETWORKS` | `eip155:8453,solana:5eykt…` | Comma-separated allowlist of CAIP-2 network IDs |
 | `X402_ALLOWED_ASSETS` | Base USDC, Solana USDC | Comma-separated allowlist of asset contract addresses |
 
-If a 402 response requests an amount, network, or asset outside these limits, the proxy **rejects the payment and returns the raw 402 to the client** without signing anything. Session spend resets when the proxy process restarts.
+Limits are checked against the exact payment option the x402 client selects and signs (the v2 `amount` field), and session budget is reserved before signing, so concurrent tool calls cannot overshoot it. If a 402 response requests an amount, network, or asset outside these limits, the proxy **rejects the payment and returns the raw 402 to the client** without signing anything. Malformed limit values or an empty allowlist stop the proxy at startup. Session spend resets when the proxy process restarts.
 
 ## What is x402?
 
@@ -187,6 +192,8 @@ Key properties:
 ```
 x402-mcp-proxy/
 ├── src/index.ts           # Proxy entry point
+├── src/payment.ts         # Payment limits, guards and x402-aware fetch
+├── src/payment.test.ts    # Payment guard tests
 ├── x402-mcps.example.json # Example remote MCP config
 ├── .env.example           # Example environment variables
 ├── package.json
@@ -219,6 +226,9 @@ The proxy ships with several safety checks enabled by default:
 - **Per-request amount cap** — rejects 402 responses that request more than the configured limit
 - **Session spending cap** — stops signing once cumulative spend reaches the threshold
 - **Network & asset allowlists** — only pays on explicitly permitted chains and tokens
+- **Tool-call-only payments** — only JSON-RPC `tools/call` POSTs to the configured remote's own origin are ever paid; handshakes, listings, SSE streams and redirects to other origins are not
+- **Install-dir config** — `.env` and `x402-mcps.json` are loaded from the proxy's own directory, not the client's working directory
+- **TLS enforcement** — refuses to start when `NODE_TLS_REJECT_UNAUTHORIZED=0`
 - **HTTPS enforcement** — warns at startup if any remote MCP URL uses an insecure protocol (non-localhost HTTP)
 - **Sanitised error output** — internal error details are not leaked to clients
 - **Structured payment audit log** — every signed payment is logged to stderr with amount, network, asset, recipient, and target URL
