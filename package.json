@@ -11,7 +11,7 @@
     "test": "tsx --test src/*.test.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "@scure/base": "^2.0.0",
     "@solana/kit": "^6.1.0",
     "@x402/axios": "^2.5.0",
